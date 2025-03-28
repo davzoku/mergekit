@@ -1,17 +1,5 @@
-# Copyright (C) 2024 Charles O. Goddard
-#
-# This software is free software: you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public License as
-# published by the Free Software Foundation, either version 3 of the
-# License, or (at your option) any later version.
-#
-# This software is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program. If not, see http://www.gnu.org/licenses/.
+# Copyright (C) 2025 Arcee AI
+# SPDX-License-Identifier: BUSL-1.1
 """
 Module for computational graph execution.
 
@@ -20,6 +8,7 @@ Classes:
     Executor: Class for scheduling and executing directed acyclic task graphs.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
@@ -30,6 +19,8 @@ from pydantic import BaseModel
 from typing_extensions import Generic, TypeVar
 
 ValueT = TypeVar("ValueT")
+
+logger = logging.getLogger(__name__)
 
 
 class Task(ABC, BaseModel, Generic[ValueT], frozen=True):
@@ -106,6 +97,12 @@ class Task(ABC, BaseModel, Generic[ValueT], frozen=True):
         """
         return False
 
+    def main_thread_only(self) -> bool:
+        """
+        Returns True if the task should only be executed on the main thread.
+        """
+        return False
+
 
 class Executor:
     """
@@ -119,6 +116,7 @@ class Executor:
         targets (List[Task]): List of target tasks to be executed.
         schedule (List[Task]): Calculated execution schedule of tasks.
         dependencies (Dict[Task, Set[Task]]): Dependencies of each task.
+        cached_values (Optional[Dict[Task, Any]]): Cached values for tasks that have been executed before in a different context.
     """
 
     math_device: torch.device
@@ -126,12 +124,14 @@ class Executor:
     targets: List[Task]
     schedule: List[Task]
     dependencies: Dict[Task, Set[Task]]
+    cached_values: Optional[Dict[Task, Any]]
 
     def __init__(
         self,
         tasks: List[Task],
         math_device: torch.device = torch.device("cpu"),
         storage_device: torch.device = torch.device("cpu"),
+        cached_values: Optional[Dict[Task, Any]] = None,
     ):
         """
         Initializes the Executor with a list of tasks and device configurations.
@@ -141,12 +141,21 @@ class Executor:
             math_device (torch.device, optional): The device for tensor computations. Defaults to CPU.
             storage_device (torch.device, optional): The device for storing results. Defaults to CPU.
         """
+        self.cached_values = cached_values
+        self.targets = tasks
+        if isinstance(math_device, str):
+            math_device = torch.device(math_device)
+        if isinstance(storage_device, str):
+            storage_device = torch.device(storage_device)
         self.math_device = math_device
         self.storage_device = storage_device
         self.schedule = self._make_schedule(tasks)
-        self.targets = tasks
 
-    def run(self) -> Iterator[Tuple[Task, Any]]:
+    def run(
+        self,
+        quiet: bool = False,
+        desc: Optional[str] = None,
+    ) -> Iterator[Tuple[Task, Any]]:
         """
         Execute the computed schedule and yield the target values.
 
@@ -156,14 +165,25 @@ class Executor:
         # determine last usage of each value, so they can be evicted afterwards
         last_use_index = {}
         for idx, task in reversed(list(enumerate(self.schedule))):
-            for t in self.dependencies[task]:
+            for t in self.dependencies.get(task, []):
                 if t not in last_use_index:
                     last_use_index[t] = idx
             if task not in last_use_index:
                 last_use_index[task] = idx
+        for task in self.cached_values or []:
+            if task not in last_use_index:
+                last_use_index[task] = len(self.schedule) + 1
 
         values: Dict[Task, Any] = {}
-        for idx, task in tqdm.tqdm(enumerate(self.schedule), total=len(self.schedule)):
+        if self.cached_values:
+            values.update(self.cached_values)
+        for idx, task in (
+            pbar := tqdm.tqdm(
+                list(enumerate(self.schedule)),
+                disable=quiet,
+                desc=desc or "Executing graph",
+            )
+        ):
             use_math_device = task.uses_accelerator()
 
             arguments = {}
@@ -172,27 +192,14 @@ class Executor:
 
                 # ensure any input tensors are on math device if task asks for it
                 if use_math_device:
-                    if (
-                        isinstance(value, torch.Tensor)
-                        and value.device != self.math_device
-                    ):
-                        value = value.to(self.math_device)
-                    elif isinstance(value, dict):
-                        for key in value:
-                            if (
-                                isinstance(value[key], torch.Tensor)
-                                and value[key].device != self.math_device
-                            ):
-                                value[key] = value[key].to(self.math_device)
+                    value = self._move_tensors(value, self.math_device)
 
                 arguments[name] = value
                 del value
 
             res = task.execute(**arguments)
             del arguments
-
-            if isinstance(res, torch.Tensor) and res.device != self.storage_device:
-                res = res.to(self.storage_device)
+            res = self._move_tensors(res, self.storage_device)
 
             values[task] = res
             del res
@@ -209,30 +216,65 @@ class Executor:
             for key in expired:
                 del values[key]
 
-    def execute(self) -> None:
+        del values
+        del pbar
+
+    def execute(self, desc: Optional[str] = None) -> None:
         """
         Execute all tasks and discard results.
         """
-        for task, value in self.run():
+        for task, value in self.run(desc=desc):
             pass
+
+    def _move_tensors(
+        self, value: Any, device: torch.device, non_blocking: Optional[bool] = None
+    ) -> Any:
+        if non_blocking is None:
+            non_blocking = device.type == "cuda"
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device, non_blocking=non_blocking)
+        elif isinstance(value, dict):
+            return {
+                k: self._move_tensors(v, device, non_blocking) for k, v in value.items()
+            }
+        elif isinstance(value, list):
+            return [self._move_tensors(v, device, non_blocking) for v in value]
+        elif isinstance(value, tuple):
+            return tuple(self._move_tensors(v, device, non_blocking) for v in value)
+        return value
 
     DUMMY_TASK_VALUE = "!!DUMMY!!"
 
     def _make_schedule(self, targets: List[Task]) -> List[Task]:
+        logger.debug(f"Building schedule for {len(targets)} targets")
         self.schedule = []
         self.dependencies = self._build_dependencies(targets)
+
+        node_indices = {}
+        node_values = []
+
+        # instead of using the actual task objects as nodes in the graph,
+        # use an integer index to avoid reserializing the task objects
+        # inside networkx (slow)
+        def _index(node: Union[Task, str]) -> int:
+            if node not in node_indices:
+                node_indices[node] = len(node_indices)
+                node_values.append(node)
+            return node_indices[node]
 
         edge_tups = []
         for node in self.dependencies:
             for dependency in self.dependencies[node]:
-                edge_tups.append((dependency, node))
+                edge_tups.append((_index(dependency), _index(node)))
 
+        # add edges from a dummy node to each target to guarantee
+        # they will be included in the final schedule
+        dummy_index = _index(Executor.DUMMY_TASK_VALUE)
         for task in targets:
-            # add edges from a dummy node to each target to guarantee
-            # they will be included in the final schedule
-            edge_tups.append((Executor.DUMMY_TASK_VALUE, task))
+            edge_tups.append((dummy_index, _index(task)))
 
-        def _compare_key(task: Union[Task, str]):
+        def _compare_key(node: int) -> Tuple[str, int]:
+            task = node_values[node]
             if task == Executor.DUMMY_TASK_VALUE:
                 return ("", 0)
             return (
@@ -241,12 +283,14 @@ class Executor:
             )
 
         graph = networkx.DiGraph(edge_tups)
-        res = [
-            t
-            for t in networkx.lexicographical_topological_sort(graph, key=_compare_key)
-            if t != Executor.DUMMY_TASK_VALUE
+        return [
+            node_values[idx]
+            for idx in networkx.lexicographical_topological_sort(
+                graph, key=_compare_key
+            )
+            if (idx != dummy_index)
+            and node_values[idx] not in (self.cached_values or {})
         ]
-        return res
 
     def _build_dependencies(self, targets: List[Task]) -> Dict[Task, Set[Task]]:
         task_dependencies: Dict[Task, Set[Task]] = {}
@@ -257,6 +301,8 @@ class Executor:
                 continue
 
             task_dependencies[child] = set()
+            if child in (self.cached_values or {}):
+                continue
             for _, dep in child.arguments().items():
                 task_dependencies[child].add(dep)
                 to_process.append(dep)

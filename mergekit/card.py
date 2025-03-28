@@ -1,26 +1,15 @@
-# Copyright (C) 2024 Charles O. Goddard
-#
-# This software is free software: you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public License as
-# published by the Free Software Foundation, either version 3 of the
-# License, or (at your option) any later version.
-#
-# This software is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program. If not, see http://www.gnu.org/licenses/.
+# Copyright (C) 2025 Arcee AI
+# SPDX-License-Identifier: BUSL-1.1
 
 import os
-from typing import List, Optional, Sequence
+from typing import Generator, List, Optional
 
 import huggingface_hub
 import yaml
 from huggingface_hub.utils import HFValidationError
 from yaml.nodes import SequenceNode as SequenceNode
 
+from mergekit import merge_methods
 from mergekit.config import MergeConfiguration, ModelReference
 
 CARD_TEMPLATE = """---
@@ -49,6 +38,26 @@ The following YAML configuration was used to produce this model:
 ```
 """
 
+CARD_TEMPLATE_LORA = """---
+{metadata}
+---
+# {name}
+
+This is a LoRA extracted from a language model. It was extracted using [mergekit](https://github.com/arcee-ai/mergekit).
+
+## LoRA Details
+
+{details}
+
+### Parameters
+
+The following command was used to extract this LoRA adapter:
+
+```sh
+{invocation}
+```
+"""
+
 
 def is_hf(path: str) -> bool:
     """
@@ -67,7 +76,7 @@ def is_hf(path: str) -> bool:
         return False
 
 
-def extract_hf_paths(models: List[ModelReference]) -> Sequence[str]:
+def extract_hf_paths(models: List[ModelReference]) -> Generator[str, None, None]:
     """
     Yields all valid Hugging Face paths from a list of ModelReference objects.
 
@@ -89,15 +98,15 @@ def method_md(merge_method: str) -> str:
     Args:
         merge_method: A string indicating the merge method used.
     """
-    methods = {
-        "linear": "[linear](https://arxiv.org/abs/2203.05482)",
-        "ties": "[TIES](https://arxiv.org/abs/2306.01708)",
-        "slerp": "SLERP",
-        "task_arithmetic": "[task arithmetic](https://arxiv.org/abs/2212.04089)",
-        "dare_ties": "[DARE](https://arxiv.org/abs/2311.03099) [TIES](https://arxiv.org/abs/2306.01708)",
-        "dare_linear": "linear [DARE](https://arxiv.org/abs/2311.03099)",
-    }
-    return methods.get(merge_method, merge_method)
+    try:
+        method = merge_methods.get(merge_method)
+    except RuntimeError:
+        return merge_method
+    ref_url = method.reference_url()
+    name = method.pretty_name() or method.name()
+    if ref_url and ref_url.strip():
+        return f"[{name}]({ref_url})"
+    return name
 
 
 def maybe_link_hf(path: str) -> str:
@@ -173,4 +182,41 @@ def generate_card(
         merge_method=method_md(config.merge_method),
         name=name,
         config_yaml=config_yaml,
+    )
+
+
+def generate_card_lora(
+    base_ref: ModelReference,
+    finetuned_ref: ModelReference,
+    invocation: str,
+    name: str,
+    base_vocab_size: Optional[int] = None,
+    final_vocab_size: Optional[int] = None,
+) -> str:
+    if not name:
+        name = "Untitled LoRA Model (1)"
+
+    hf_bases = list(extract_hf_paths([base_ref, finetuned_ref]))
+    tags = ["mergekit", "peft"]
+
+    details = (
+        f"This LoRA adapter was extracted from {modelref_md(finetuned_ref)} "
+        f"and uses {modelref_md(base_ref)} as a base."
+    )
+
+    if base_vocab_size and final_vocab_size and base_vocab_size != final_vocab_size:
+        verb = "extended" if final_vocab_size > base_vocab_size else "reduced"
+        details += (
+            f"\n\n [!WARNING]\n> The vocabulary size has been {verb} from the base "
+            f"model's {base_vocab_size} to {final_vocab_size}. To load this adapter, "
+            f"you must first call `model.resize_token_embeddings({final_vocab_size})`."
+        )
+
+    return CARD_TEMPLATE_LORA.format(
+        metadata=yaml.dump(
+            {"base_model": hf_bases, "tags": tags, "library_name": "peft"}
+        ),
+        name=name,
+        details=details,
+        invocation=invocation,
     )

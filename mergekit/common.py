@@ -1,17 +1,5 @@
-# Copyright (C) 2024 Charles O. Goddard
-#
-# This software is free software: you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public License as
-# published by the Free Software Foundation, either version 3 of the
-# License, or (at your option) any later version.
-#
-# This software is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program. If not, see http://www.gnu.org/licenses/.
+# Copyright (C) 2025 Arcee AI
+# SPDX-License-Identifier: BUSL-1.1
 
 import binascii
 import logging
@@ -23,9 +11,9 @@ from typing import (
     Dict,
     Generic,
     Iterator,
-    List,
     Mapping,
     Optional,
+    Protocol,
     Tuple,
     Union,
     get_args,
@@ -36,12 +24,38 @@ import immutables
 import peft
 import torch
 import transformers
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, model_serializer, model_validator
 from pydantic_core import core_schema
 from transformers import AutoConfig, PretrainedConfig
 from typing_extensions import TypeVar
 
-from mergekit.io import ShardedTensorIndex
+from mergekit.io import LazyTensorLoader, ShardedTensorIndex
+
+
+def set_config_value(config: PretrainedConfig, key: str, value: Any):
+    """Set a value in a PretrainedConfig object."""
+    parts = key.split(".")
+    obj = config
+    for idx, part in enumerate(parts[:-1]):
+        if not hasattr(obj, part):
+            raise RuntimeError(
+                f"Config {config} has no attribute {'.'.join(parts[:idx+1])}"
+            )
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
+def get_config_value(config: PretrainedConfig, key: str) -> Any:
+    """Get a value from a PretrainedConfig object."""
+    parts = key.split(".")
+    obj = config
+    for idx, part in enumerate(parts):
+        if not hasattr(obj, part):
+            raise RuntimeError(
+                f"Config {config} has no attribute {'.'.join(parts[:idx+1])}"
+            )
+        obj = getattr(obj, part)
+    return obj
 
 
 class ModelPath(BaseModel, frozen=True):
@@ -81,9 +95,13 @@ class ModelReference(BaseModel, frozen=True):
 
     model: ModelPath
     lora: Optional[ModelPath] = None
+    override_architecture: Optional[str] = None
 
     def merged(
-        self, cache_dir: Optional[str] = None, trust_remote_code: bool = False
+        self,
+        cache_dir: Optional[str] = None,
+        trust_remote_code: bool = False,
+        lora_merge_dtype: Optional[str] = None,
     ) -> "ModelReference":
         """Merge the LoRA if applicable and return a reference to the result."""
         if not self.lora:
@@ -99,11 +117,15 @@ class ModelReference(BaseModel, frozen=True):
 
         if not os.path.exists(out_path):
             os.makedirs(out_path, exist_ok=True)
+
+            config = self.config(trust_remote_code)
+            auto_cls = get_auto_cls(config.architectures[0])
+
             logging.info(f"Loading {self.model} for merge...")
-            model = transformers.AutoModelForCausalLM.from_pretrained(
+            model = auto_cls.from_pretrained(
                 self.model.path,
                 revision=self.model.revision,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype_from_name(lora_merge_dtype),
                 low_cpu_mem_usage=True,
                 trust_remote_code=trust_remote_code,
             )
@@ -115,16 +137,19 @@ class ModelReference(BaseModel, frozen=True):
             model.save_pretrained(out_path, safe_serialization=True)
             del model
 
-        return ModelReference(model=out_path)
+        return ModelReference(model=ModelPath(path=out_path))
 
     def config(self, trust_remote_code: bool = False) -> PretrainedConfig:
-        return AutoConfig.from_pretrained(
+        res = AutoConfig.from_pretrained(
             self.model.path,
             revision=self.model.revision,
             trust_remote_code=trust_remote_code,
         )
+        if self.override_architecture:
+            res.architectures = [self.override_architecture]
+        return res
 
-    def tensor_index(self, cache_dir: Optional[str] = None) -> ShardedTensorIndex:
+    def local_path(self, cache_dir: Optional[str] = None) -> str:
         assert self.lora is None
 
         path = self.model.path
@@ -147,8 +172,18 @@ class ModelReference(BaseModel, frozen=True):
                 cache_dir=cache_dir,
                 allow_patterns=patterns,
             )
+        return path
 
-        return ShardedTensorIndex.from_disk(path)
+    def tensor_index(self, cache_dir: Optional[str] = None) -> ShardedTensorIndex:
+        return ShardedTensorIndex.from_disk(self.local_path(cache_dir))
+
+    def lazy_loader(
+        self, cache_dir: Optional[str] = None, lazy_unpickle: bool = True
+    ) -> LazyTensorLoader:
+        return LazyTensorLoader(
+            self.tensor_index(cache_dir),
+            lazy_unpickle=lazy_unpickle,
+        )
 
     @model_validator(mode="before")
     def validate_string(cls, value):
@@ -161,6 +196,19 @@ class ModelReference(BaseModel, frozen=True):
             raise RuntimeError(f"Can't parse {value}")
         return value
 
+    @model_serializer()
+    def serialize(self):
+        if self.override_architecture is not None:
+            return {
+                "model": self.model,
+                "lora": self.lora,
+                "override_architecture": self.override_architecture,
+            }
+        res = str(self)
+        if '"' in res or " " in res:
+            return self
+        return res
+
     @classmethod
     def parse(cls, value: str) -> "ModelReference":
         """Parse a ModelReference. Format: '<MODEL_PATH>(+<LORA_PATH>)?'"""
@@ -172,7 +220,10 @@ class ModelReference(BaseModel, frozen=True):
         return str(self.model)
 
 
-def dtype_from_name(name: Optional[str]) -> torch.dtype:
+def dtype_from_name(name: Optional[str]) -> Optional[torch.dtype]:
+    if not name:
+        return None
+
     if name.startswith("torch."):
         name = name[len("torch.") :]
 
@@ -182,34 +233,9 @@ def dtype_from_name(name: Optional[str]) -> torch.dtype:
         return torch.float16
     elif name == "float32":
         return torch.float32
+    elif name == "int64":
+        return torch.int64
     raise RuntimeError(f'Unimplemented dtype "{name}"')
-
-
-def rectify_embed_sizes(param_name: str, tensors: List[torch.Tensor]):
-    # TODO: use arch_info.embed_weights() instead
-    if ("lm_head" in param_name or "embed_tokens" in param_name) and all(
-        len(t.shape) == 2 for t in tensors
-    ):
-        # special case - if lm_head.weight or embed_tokens.weight have a size
-        # mismatch, take the largest common submatrix of all of them
-        if take_common_submatrix(tensors):
-            logging.warning(
-                f"Using common submatrix of size {tensors[0].shape} for {param_name}"
-            )
-
-
-def take_common_submatrix(tensors: List[torch.Tensor]) -> bool:
-    min_size = [None, None]
-    for t in tensors:
-        for idx in range(2):
-            if min_size[idx] is None or t.shape[idx] < min_size[idx]:
-                min_size[idx] = t.shape[idx]
-
-    if not all(t.shape == torch.Size(min_size) for t in tensors):
-        for idx in range(len(tensors)):
-            tensors[idx] = tensors[idx][: min_size[0], : min_size[1]]
-        return True
-    return False
 
 
 def parse_kmb(value: Union[str, int]) -> int:
@@ -271,3 +297,82 @@ class ImmutableMap(Generic[T_K, T_V]):
 
     def values(self) -> Iterator[T_V]:
         return self.data.values()
+
+
+ARCH_NAME_TO_AUTO_CLS = {}
+
+try:
+    import transformers.models.auto.modeling_auto as tf_auto
+except ImportError:
+    tf_auto = None
+
+if tf_auto is not None:
+    for map_name, cls_name in [
+        ("MODEL_MAPPING_NAMES", "AutoModel"),
+        (
+            "MODEL_FOR_AUDIO_CLASSIFICATION_MAPPING_NAMES",
+            "AutoModelForAudioClassification",
+        ),
+        (
+            "MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES",
+            "AutoModelForImageClassification",
+        ),
+        ("MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES", "AutoModelForSpeechSeq2Seq"),
+        (
+            "MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING_NAMES",
+            "AutoModelForSequenceClassification",
+        ),
+        ("MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES", "AutoModelForSeq2SeqLM"),
+        (
+            "MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING_NAMES",
+            "AutoModelForTokenClassification",
+        ),
+        ("MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES", "AutoModelForImageTextToText"),
+        ("MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES", "AutoModelForTextToWaveform"),
+        ("MODEL_FOR_MASKED_LM_MAPPING_NAMES", "AutoModelForMaskedLM"),
+        ("MODEL_FOR_CAUSAL_LM_MAPPING_NAMES", "AutoModelForCausalLM"),
+    ]:
+        cls = getattr(transformers, cls_name, None)
+        if cls is None:
+            logging.info(f"Could not find {cls_name} in transformers")
+            continue
+        if hasattr(tf_auto, map_name):
+            name_to_arch_name = getattr(tf_auto, map_name)
+            for arch_name in name_to_arch_name.values():
+                ARCH_NAME_TO_AUTO_CLS[arch_name] = cls
+
+
+class AutoClassProtocol(Protocol):
+    def from_pretrained(
+        self,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ) -> transformers.PreTrainedModel: ...
+
+    def from_config(
+        self,
+        config: transformers.PretrainedConfig,
+        *model_args,
+        **kwargs,
+    ) -> transformers.PreTrainedModel: ...
+
+
+def get_auto_cls(arch_name: str) -> AutoClassProtocol:
+    """Get the AutoModel class for a given architecture name."""
+    if arch_name in ARCH_NAME_TO_AUTO_CLS:
+        return ARCH_NAME_TO_AUTO_CLS[arch_name]
+
+    if arch_name.endswith("ForMaskedLM"):
+        auto_cls = transformers.AutoModelForMaskedLM
+    elif arch_name.endswith("ForSequenceClassification"):
+        auto_cls = transformers.AutoModelForSequenceClassification
+    elif arch_name.endswith("ForTokenClassification"):
+        auto_cls = transformers.AutoModelForTokenClassification
+    else:
+        if not arch_name.endswith("ForCausalLM") or arch_name.endswith("LMHeadModel"):
+            logging.warning(
+                f"Unknown model type {arch_name} - assuming AutoModelForCausalLM"
+            )
+        auto_cls = transformers.AutoModelForCausalLM
+    return auto_cls

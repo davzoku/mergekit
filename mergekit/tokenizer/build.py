@@ -1,32 +1,23 @@
-# Copyright (C) 2024 Charles O. Goddard
-#
-# This software is free software: you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public License as
-# published by the Free Software Foundation, either version 3 of the
-# License, or (at your option) any later version.
-#
-# This software is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program. If not, see http://www.gnu.org/licenses/.
+# Copyright (C) 2025 Arcee AI
+# SPDX-License-Identifier: BUSL-1.1
 
 import json
 import logging
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import tokenizers
 import tokenizers.models
-import torch
 import tqdm
 import transformers
 from pydantic import BaseModel
+from typing_extensions import Literal
 
-from mergekit.common import ModelPath, ModelReference
+from mergekit.architecture import arch_info_for_config
+from mergekit.common import ModelPath, ModelReference, get_config_value
 from mergekit.graph import Task
+
+logger = logging.getLogger(__name__)
 
 
 def get_vocab_size(model_path: ModelPath, trust_remote_code: bool) -> Optional[int]:
@@ -36,9 +27,10 @@ def get_vocab_size(model_path: ModelPath, trust_remote_code: bool) -> Optional[i
             revision=model_path.revision,
             trust_remote_code=trust_remote_code,
         )
-        return cfg.vocab_size
+        arch_info = arch_info_for_config(cfg)
+        return get_config_value(cfg, arch_info.vocab_size_config_key or "vocab_size")
     except Exception as e:
-        logging.warning(f"Unable to get vocab size for {model_path}", exc_info=e)
+        logger.warning(f"Unable to get vocab size for {model_path}", exc_info=e)
 
     return None
 
@@ -90,7 +82,12 @@ def get_stripped_tokenizer(
             del tok_dict["model"]["vocab"][tok]
 
     def _keep_merge(m):
-        toks = m.split(" ")
+        if isinstance(m, str) and m.count(" ") == 1:
+            toks = m.split(" ")
+        elif isinstance(m, list):
+            toks = m
+        else:
+            raise RuntimeError(f"Unexpected merge format: {repr(m)} ({type(m)})")
         for tok in toks:
             if tok in unused_toks:
                 return False
@@ -123,7 +120,7 @@ def build_union_tokenizer(
         vocab = tokenizer.get_vocab()
         for tok, idx in vocab.items():
             if idx >= vocab_size:
-                logging.warning(
+                logger.warning(
                     f"Token {repr(tok)} present in {str(model)} tokenizer but >= vocab_size"
                 )
                 continue
@@ -141,7 +138,7 @@ def build_union_tokenizer(
 
             if tok in out_added_tokens:
                 if (out_added_tokens[tok] != info) and tok not in warned_added_tokens:
-                    logging.warning(
+                    logger.warning(
                         f"Token '{tok}' added with multiple different settings, using first"
                     )
                     warned_added_tokens.add(tok)
@@ -169,12 +166,19 @@ def build_union_tokenizer(
     return res
 
 
+class TokenizerInfo(BaseModel, arbitrary_types_allowed=True):
+    tokenizer: transformers.PreTrainedTokenizerBase
+    permutations: Dict[ModelReference, Dict[int, int]]
+    original_vocabs: Dict[ModelReference, Dict[str, int]]
+
+
 def build_tokenizer(
     base_model: Optional[ModelReference],
     referenced_models: List[ModelReference],
-    tokenizer_source: str,
+    tokenizer_source: Union[Literal["union"], Literal["base"], ModelReference],
     trust_remote_code: bool,
-) -> Tuple[transformers.PreTrainedTokenizer, Dict[ModelReference, torch.IntTensor]]:
+    add_tokens: Optional[List[str]] = None,
+) -> TokenizerInfo:
     if base_model is None:
         base_model = referenced_models[0]
     if base_model is None:
@@ -186,7 +190,7 @@ def build_tokenizer(
     )
 
     # load all tokenizers
-    logging.info("Loading tokenizers")
+    logger.info("Loading tokenizers")
     tokenizers = {base_model: tokenizer_base}
     for model in referenced_models:
         if model == base_model:
@@ -199,35 +203,41 @@ def build_tokenizer(
                 trust_remote_code=trust_remote_code,
             )
         except Exception as e:
-            logging.error(e)
-            logging.warning(
+            logger.error(e)
+            logger.warning(
                 f"Unable to load tokenizer for {model}. Assuming same as {base_model}."
             )
             continue
         tokenizers[model] = model_tok
 
-    logging.info("Building output tokenizer")
+    logger.info("Building output tokenizer")
     # build final vocabulary
-    if tokenizer_source == "base":
+    if isinstance(tokenizer_source, ModelReference):
+        tokenizer_out = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_source.model.path,
+            revision=tokenizer_source.model.revision,
+            trust_remote_code=trust_remote_code,
+        )
+    elif tokenizer_source == "base":
         # it done
         tokenizer_out = tokenizer_base
     elif tokenizer_source == "union":
         tokenizer_out = build_union_tokenizer(
             tokenizer_base, tokenizers, trust_remote_code=trust_remote_code
         )
-    elif tokenizer_source.startswith("model:"):
-        tokenizer_out = transformers.AutoTokenizer.from_pretrained(
-            tokenizer_source[len("model:") :],
-            trust_remote_code=trust_remote_code,
-        )
     else:
         raise RuntimeError(f"Unimplemented tokenizer source: {tokenizer_source}")
 
+    for tok in add_tokens:
+        tokenizer_out.add_tokens(tok)
+
     vocab_out = tokenizer_out.get_vocab()
 
-    logging.info("Building permutations")
+    logger.info("Building permutations")
     permutations = {}
-    for model in tqdm.tqdm(referenced_models):
+    for model in (
+        pbar := tqdm.tqdm(referenced_models, desc="Building tokenizer permutations")
+    ):
         if model in tokenizers:
             model_vocab = tokenizers[model].get_vocab()
         else:
@@ -246,7 +256,7 @@ def build_tokenizer(
 
             orig_idx = model_vocab[tok]
             if orig_idx >= vocab_size:
-                logging.warning(
+                logger.warning(
                     f"{model} token {repr(tok)} has index {orig_idx}>{vocab_size-1} (padding?)"
                 )
                 continue
@@ -255,28 +265,30 @@ def build_tokenizer(
 
         permutations[model] = p
 
-    return tokenizer_out, permutations
+    del pbar
 
-
-class TokenizerInfo(BaseModel, arbitrary_types_allowed=True):
-    tokenizer: transformers.PreTrainedTokenizerBase
-    permutations: Optional[Dict[ModelReference, Dict[int, int]]]
+    return TokenizerInfo(
+        tokenizer=tokenizer_out,
+        permutations=permutations,
+        original_vocabs={model: tok.get_vocab() for model, tok in tokenizers.items()},
+    )
 
 
 class BuildTokenizer(Task[TokenizerInfo]):
     base_model: Optional[ModelReference]
     referenced_models: Tuple[ModelReference, ...]
-    tokenizer_source: str
+    tokenizer_source: Union[Literal["union"], Literal["base"], ModelReference]
+    add_tokens: Optional[Tuple[str, ...]]
     trust_remote_code: bool = False
 
     def arguments(self) -> Dict[str, Task]:
         return {}
 
     def execute(self, **_kwargs) -> TokenizerInfo:
-        tokenizer, permutations = build_tokenizer(
-            self.base_model,
-            self.referenced_models,
-            self.tokenizer_source,
-            self.trust_remote_code,
+        return build_tokenizer(
+            base_model=self.base_model,
+            referenced_models=self.referenced_models,
+            tokenizer_source=self.tokenizer_source,
+            trust_remote_code=self.trust_remote_code,
+            add_tokens=self.add_tokens,
         )
-        return TokenizerInfo(tokenizer=tokenizer, permutations=permutations)
